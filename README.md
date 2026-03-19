@@ -2,15 +2,14 @@
 
 基于 **Ray**, **vLLM** 和 **PyTorch FSDP** 实现的高效轻量化 **GRPO** (Group Relative Policy Optimization) 分布式训练框架。
 
-本项目参考了 SWIFT、PAI-Megatron-Patch 和 verl 的设计哲学，旨在解决大规模语言模型在强化学习训练中的显存瓶颈与分布式同步死锁问题。
-
+本项目通过 Ray + vLLM + FSDP 的选型，将训练逻辑与复杂的底层基础设施解耦，彻底解决了环境配置难、层级依赖深的问题。
+它既吸取了 verl 等成熟框架的设计精髓，又保持了代码的高度简洁与可维护性，实现了性能与易用性的平衡。
 
 
 ## 1. 核心架构设计
 
 为了最大化异构资源利用率，系统采用 **推理-训练分离 (Hybrid Orchestration)** 策略：
-
-* **推理引擎 (vLLM Actor)**: 独立占用一个 GPU 节点（Rank 0），利用 vLLM 的 Continuous Batching 提高采样吞吐量。
+* **推理引擎 (vLLM Actor)**: 利用 vLLM 的 Continuous Batching 提高采样吞吐量。
 * **训练引擎 (FSDP Workers)**: 在剩余 GPU 上通过 PyTorch FSDP 实现模型参数、梯度和优化器状态的分片（Sharding），大幅降低单卡显存占用。
 * **同步控制层**: 针对 Ray 与 NCCL 混合环境下的死锁风险，实现了 **Triple-Barrier** 状态机协议，确保异步采样与同步训练的步调一致。
 
@@ -39,8 +38,6 @@ $$A_{i,j} = \frac{r_{i,j} - \text{mean}(r_{i,k})}{\text{std}(r_{i,k}) + \epsilon
 1.  **采样前置同步 (Pre-sampling Barrier)**: 确保所有训练卡完成上一轮梯度更新并对齐参数后，再进入 vLLM 采样阶段。
 2.  **数据广播同步 (Data Broadcast)**: 由 Rank 0 获取采样数据后通过 `dist.broadcast_object_list` 分发，保证所有 Worker 训练输入完全一致。
 3.  **汇报后置同步 (Post-reporting Barrier)**: 确保 `ray.train.report` 在分布式通信彻底结束后执行，防止 Rank 0 提前进入下一轮迭代导致 NCCL 环崩溃。
-
-
 
 ## 4. 目录结构
 
