@@ -1,0 +1,132 @@
+import os
+import torch
+import torch.nn as nn
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.optim import AdamW
+from transformers import AutoModelForCausalLM, get_scheduler
+
+import ray.train.torch
+from ray.train import ScalingConfig, Checkpoint
+from ray.train.torch import TorchTrainer
+from typing import Dict, Any
+
+def train_loop_per_worker(config: Dict[str, Any]):
+    """
+    此函数会被 Ray 分发到每个 GPU 进程中执行。
+    两张 A100 会启动两个进程：Rank 0 和 Rank 1。
+    """
+    # 1. 分布式上下文初始化
+    rank = ray.train.get_context().get_world_rank()
+    local_rank = ray.train.get_context().get_local_rank()
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+
+    # 2. 加载模型 (每个进程都加载，但 FSDP 会处理实际显存分片)
+    model = AutoModelForCausalLM.from_pretrained(
+        config["model_path"],
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+        local_files_only=True  # 👈 强制只读本地，防止 Worker 联网报错
+    )
+    # 开启梯度检查点 (大模型训练必开，省显存)
+    model.gradient_checkpointing_enable()
+
+    # 3. 包装 FSDP2
+    # 此时模型会被真正切分到 GPU 0 和 GPU 1 上
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
+    model = fully_shard(model, mp_policy=mp_policy)
+    
+    # 4. 设置优化器
+    optimizer = AdamW(model.parameters(), lr=config.get("lr", 1e-5))
+    lr_scheduler = get_scheduler(
+        "linear",
+        optimizer=optimizer,
+        num_warmup_steps=10,
+        num_training_steps=config.get("total_steps", 100)
+    )
+
+    # 5. 定义内部 GRPO 辅助方法 (因在 loop 内，直接闭包引用)
+    def get_per_token_logprobs(logits, input_ids):
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        target_log_probs = log_probs[:, :-1, :]
+        target_ids = input_ids[:, 1:, None]
+        return torch.gather(target_log_probs, 2, target_ids).squeeze(-1)
+
+    def compute_group_advantages(rewards, group_size):
+        rewards = rewards.view(-1, group_size)
+        mean = rewards.mean(dim=1, keepdim=True)
+        std = rewards.std(dim=1, keepdim=True)
+        return ((rewards - mean) / (std + 1e-8)).view(-1)
+
+    # 6. 模拟训练迭代
+    model.train()
+    for step in range(config.get("total_steps", 10)):
+        # --- 模拟从 vLLM 接收到的数据 ---
+        # 这里在真实场景中应从 ray.train.get_dataset_shard() 或 Queue 获取
+        batch_size = 1
+        group_size = config.get("group_size", 8)
+        seq_len = 128
+        
+        input_ids = torch.randint(0, 32000, (batch_size * group_size, seq_len)).to(device)
+        old_logprobs = torch.randn(batch_size * group_size, seq_len - 1).to(device)
+        rewards = torch.randn(batch_size * group_size).to(device)
+
+        # --- 核心训练步 ---
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # 计算 Advantage
+            advantages = compute_group_advantages(rewards, group_size)
+            
+            # 前向传播
+            outputs = model(input_ids)
+            curr_logprobs = get_per_token_logprobs(outputs.logits, input_ids)
+
+            # GRPO Loss 计算
+            ratio = torch.exp(curr_logprobs - old_logprobs)
+            adv_tiled = advantages.unsqueeze(1)
+            mask = (input_ids[:, 1:] != 0).float()
+            
+            surr1 = ratio * adv_tiled
+            surr2 = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2) * adv_tiled
+            policy_loss = -(torch.min(surr1, surr2) * mask).sum() / mask.sum()
+            
+            beta = 0.04
+            kl = torch.exp(old_logprobs - curr_logprobs) - (old_logprobs - curr_logprobs) - 1
+            kl_loss = beta * (kl * mask).sum() / mask.sum()
+            
+            total_loss = policy_loss + kl_loss
+
+        # 反向传播与优化
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        lr_scheduler.step()
+
+        # 汇报指标给 Ray Dashboard
+        if rank == 0:
+            print(f"Step {step} | Loss: {total_loss.item():.4f}")
+        
+        ray.train.report({"loss": total_loss.item(), "step": step})
+
+# --- 启动器部分 ---
+
+def get_ray_trainer(model_path: str):
+    config = {
+        "model_path": model_path,
+        "lr": 1e-5,
+        "group_size": 8,
+        "total_steps": 100
+    }
+
+    scaling_config = ScalingConfig(
+        num_workers=2,            # 对应你的 2 张显卡
+        use_gpu=True,
+        resources_per_worker={"GPU": 1}
+    )
+
+    return TorchTrainer(
+        train_loop_per_worker,
+        train_loop_config=config,
+        scaling_config=scaling_config,
+    )

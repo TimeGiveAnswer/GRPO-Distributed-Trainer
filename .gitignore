@@ -1,0 +1,11 @@
+# 屏蔽模型权重
+models/
+# 屏蔽 Ray 运行日志
+ray_results/
+/tmp/ray/
+# 屏蔽 Python 缓存
+__pycache__/
+*.pyc
+# 屏蔽数据
+*.parquet
+*.jsonl

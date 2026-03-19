@@ -1,0 +1,66 @@
+import ray
+import torch
+import os
+from src.trainer import GRPOTrainer
+from src.trainer.mock_data import MockExperienceMaker
+
+def test_grpo_actor_flow():
+    # 1. 初始化 Ray (确保之前的残留清理干净)
+    if ray.is_initialized():
+        ray.shutdown()
+    ray.init()
+
+    # 2. 配置参数 (务必检查你的模型路径)
+    # 建议使用绝对路径，防止 Actor 在远程节点找不到模型
+    MODEL_PATH = "/mnt/GRPO_project/models/Qwen2.5-3B-Instruct" 
+    
+    config = {
+        "model_path": MODEL_PATH,
+        "lr": 1e-5,
+        "group_size": 8,
+        "seq_len": 256,
+        "total_steps": 10,
+        "beta": 0.04,
+        "clip_eps": 0.2,
+        "port": 12356  # 分布式通信端口
+    }
+
+    print(f"🚀 正在初始化 GRPOTrainer Actor (双卡 A100)...")
+    try:
+        # 3. 实例化分布式 Actor
+        trainer_actor = GRPOTrainer.remote(config)
+        
+        # 4. 准备模拟数据生成器 (在 Driver 端生成，模拟外部输入)
+        # 注意：Driver 端不需要 GPU，所以 device 设为 cpu，传给 Actor 时它会自动搬运
+        data_maker = MockExperienceMaker(device="cpu")
+
+        print("✅ Trainer 已就绪，开始推送模拟数据训练...")
+        print("-" * 30)
+
+        for step in range(5):
+            # 生成一波模拟经验
+            batch = data_maker.make_batch(
+                batch_size=1, 
+                group_size=config["group_size"], 
+                seq_len=config["seq_len"]
+            )
+            
+            # 💡 远程调用 Actor 的训练方法
+            loss_ref = trainer_actor.train_step.remote(batch)
+            loss_val = ray.get(loss_ref) # 阻塞获取结果
+            
+            print(f"Step {step} | Loss: {loss_val:.4f} | Reward Mean: {batch['rewards'].mean():.2f}")
+
+        # 5. 测试保存功能
+        save_path = "./checkpoints/grpo_test_model"
+        print(f"\n💾 正在测试模型保存至: {save_path}")
+        ray.get(trainer_actor.save_checkpoint.remote(save_path))
+        print("✅ 保存成功！")
+
+    except Exception as e:
+        print(f"\n❌ 测试失败，捕获到异常:\n{str(e)}")
+    finally:
+        ray.shutdown()
+
+if __name__ == "__main__":
+    test_grpo_actor_flow()

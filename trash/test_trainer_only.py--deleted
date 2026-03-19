@@ -1,0 +1,47 @@
+import ray
+from ray import train
+from src.trainer.grpo_ray_trainer import get_ray_trainer
+import os
+
+def run_distributed_test():
+    # 1. 环境初始化
+    # 确保之前的残留进程被清理，并指定本地日志路径
+    if ray.is_initialized():
+        ray.shutdown()
+    
+    # 初始化 Ray，限制资源
+    ray.init(num_gpus=2)
+
+    print("🚀 正在启动分布式 GRPO Trainer (Ray Train + FSDP2)...")
+    print("目标：2 个 Worker，每卡 1 个进程。")
+
+    # 2. 获取配置好的 Trainer
+    # 请确保路径指向你本地的 Qwen2.5-3B 模型文件夹
+    model_path = "/mnt/GRPO_project/models/Qwen2.5-3B-Instruct" 
+    
+    if not os.path.exists(model_path):
+        # 兜底：如果路径不对，先用一个能跑通的线上引用测试逻辑
+        model_path = "/mnt/GRPO_project/models/Qwen2.5-3B-Instruct" 
+        print(f"⚠️ 未找到本地路径，将尝试从 HuggingFace 下载 (可能会慢): {model_path}")
+
+    trainer = get_ray_trainer(model_path)
+
+    # 3. 执行训练 (fit 会自动阻塞直到训练结束或报错)
+    try:
+        result = trainer.fit()
+        
+        # 4. 检查结果
+        print("\n" + "="*50)
+        print("✅ 分布式测试成功完成！")
+        print(f"训练结果包含指标: {result.metrics.keys()}")
+        print(f"最终 Loss: {result.metrics.get('loss'):.4f}")
+        print(f"检查点保存路径: {result.checkpoint}")
+        print("="*50)
+
+    except Exception as e:
+        print("\n" + "❌"*20)
+        print(f"测试失败！错误信息:\n{str(e)}")
+        print("❌"*20)
+
+if __name__ == "__main__":
+    run_distributed_test()
